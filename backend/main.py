@@ -64,8 +64,12 @@ try:
     log.info("Whisper 'base' loaded ✓")
 except Exception as e:
     _whisper_model = None
-    HAS_WHISPER = False
-    log.warning(f"Whisper unavailable: {e}")
+    if HAS_GROQ:
+        HAS_WHISPER = True
+        log.info("Whisper ready ✓ (Cloud Whisper via Groq whisper-large-v3)")
+    else:
+        HAS_WHISPER = False
+        log.warning(f"Whisper unavailable: {e}")
 
 # ─── RawNet2 + AASIST ────────────────────────────────────────────────────────
 try:
@@ -119,14 +123,31 @@ SCAM_KEYWORDS: dict[str, int] = {
 # ══════════════════════════════════════════════════════════════════════════════
 
 def transcribe_whisper(raw_bytes: bytes, sr: int = 16000) -> str:
-    """Transcribe raw PCM int16 bytes → text using Whisper."""
+    """Transcribe raw PCM int16 bytes → text using local Whisper or Groq whisper-large-v3."""
     if not HAS_WHISPER or not raw_bytes:
         return ""
     try:
-        audio = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-        result = _whisper_model.transcribe(audio, language="en", fp16=False,
-                                           condition_on_previous_text=False)
-        text = result.get("text", "").strip()
+        if _whisper_model is not None:
+            audio = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            result = _whisper_model.transcribe(audio, language="en", fp16=False,
+                                               condition_on_previous_text=False)
+            text = result.get("text", "").strip()
+        elif _groq is not None:
+            buf = io.BytesIO()
+            with wave.open(buf, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(sr)
+                wf.writeframes(raw_bytes)
+            buf.seek(0)
+            res = _groq.audio.transcriptions.create(
+                model="whisper-large-v3",
+                file=("chunk.wav", buf.read(), "audio/wav")
+            )
+            text = (res.text or "").strip()
+        else:
+            return ""
+
         if len(text) < 2:
             return ""
         log.info(f"Whisper: '{text[:80]}'")
@@ -655,6 +676,7 @@ async def analyse_stream(ws: WebSocket):
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/health")
+@app.api_route("/api/health", methods=["GET", "HEAD"])
 async def health():
     return {
         "status":  "ok",

@@ -575,13 +575,35 @@
   // ══════════════════════════════════════════════════════════════════════════
 
   function setStatus(msg, type = 'info') {
-    const el = $('ws-status-text');
-    const dot = $('live-dot') || document.querySelector('.risk-dot-small');
-    if (el) { el.textContent = msg; el.className = 'ws-status-badge ws-status-' + type; }
-    if (dot) {
-      dot.className = (dot.classList.contains('risk-dot-small') ? 'risk-dot-small' : 'live-dot')
-                    + (type === 'ok' ? ' active' : '');
-    }
+    const badges = document.querySelectorAll('.ws-status-badge, [id="ws-status-text"]');
+    badges.forEach(el => {
+      el.textContent = msg;
+      el.className = 'ws-status-badge ws-status-' + type;
+    });
+    const dots = document.querySelectorAll('.live-dot, .risk-dot-small, [id="live-dot"]');
+    dots.forEach(dot => {
+      const isSmall = dot.classList.contains('risk-dot-small');
+      dot.className = (isSmall ? 'risk-dot-small' : 'live-dot') + (type === 'ok' ? ' active' : '');
+    });
+  }
+
+  function updateButtons(running) {
+    const btns = document.querySelectorAll('.btn-live-analysis, .btn-risk-start, [id="btn-start-analysis"]');
+    btns.forEach(btn => {
+      if (running) {
+        btn.innerHTML = '⏹ Stop Analysis';
+        btn.classList.add('stop');
+      } else {
+        btn.innerHTML = '▶ Start Live Analysis';
+        btn.classList.remove('stop');
+      }
+    });
+    const dots = document.querySelectorAll('#risk-dot, .risk-meter-dot');
+    dots.forEach(d => {
+      d.className = running ? 'risk-meter-dot active' : 'risk-meter-dot';
+    });
+    const modeEl = $('risk-mode');
+    if (modeEl && running) modeEl.textContent = 'ANALYSING';
   }
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -665,7 +687,14 @@
     ws.onclose = () => {
       if (isRunning) {
         setStatus('Reconnecting…', 'warn');
-        setTimeout(() => { if (isRunning) connectWS(startMic); }, 3000);
+        setTimeout(() => {
+          if (isRunning) {
+            connectWS(async () => {
+              if (!mediaStream) await startMic();
+              startSpeechRecognition();
+            });
+          }
+        }, 3000);
       }
     };
   }
@@ -684,7 +713,11 @@
   // ══════════════════════════════════════════════════════════════════════════
 
   async function startMic() {
+    if (mediaStream && audioCtx && processor) return;
     try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error('Microphone access requires HTTPS or http://localhost');
+      }
       mediaStream = await navigator.mediaDevices.getUserMedia({
         audio: { channelCount: 1, sampleRate: SAMPLE_RATE,
                  echoCancellation: false, noiseSuppression: false, autoGainControl: false }
@@ -703,8 +736,7 @@
       source.connect(processor);
       processor.connect(audioCtx.destination);
     } catch(err) {
-      setStatus('Mic denied: ' + err.message, 'error');
-      stopAnalysis();
+      setStatus('Mic notice: ' + err.message, 'warn');
     }
   }
 
@@ -725,12 +757,7 @@
     criticalAlertShown = false;
     sessionData = { chunks: [], auraHistory: [], startTime: Date.now(), finalData: null };
 
-    const btn = $('btn-start-analysis');
-    if (btn) { btn.textContent = '⏹ Stop Analysis'; btn.classList.add('stop'); }
-    const dot = $('risk-dot');
-    if (dot) dot.className = 'risk-meter-dot active';
-    const modeEl = $('risk-mode');
-    if (modeEl) modeEl.textContent = 'ANALYSING';
+    updateButtons(true);
 
     connectWS(async () => {
       await startMic();
@@ -744,14 +771,40 @@
     stopSpeechRecognition();
     if (ws) { try { ws.close(); } catch(e){} ws = null; }
 
-    const btn = $('btn-start-analysis');
-    if (btn) { btn.textContent = '▶ Start Live Analysis'; btn.classList.remove('stop'); }
-    const dot = $('risk-dot');
-    if (dot) dot.className = 'risk-meter-dot';
+    updateButtons(false);
+    setStatus('Analysis stopped. Use "Download Report" for PDF.', 'info');
     const modeEl = $('risk-mode');
     if (modeEl) modeEl.textContent = 'INACTIVE';
+  }
 
-    setStatus('Analysis stopped. Use "Download Report" for PDF.', 'info');
+  // ══════════════════════════════════════════════════════════════════════════
+  // HEALTH CHECK
+  // ══════════════════════════════════════════════════════════════════════════
+
+  function pollHealth() {
+    fetch('http://localhost:8000/health', { signal: AbortSignal.timeout(2500) })
+      .then(r => r.json())
+      .then(d => {
+        const parts = [];
+        if (d.models)  parts.push('RawNet2+AASIST');
+        if (d.whisper) parts.push('Whisper');
+        if (d.groq)    parts.push('Groq LLM');
+        if (!isRunning) {
+          setStatus(
+            `Backend ready ✓ — ${parts.length ? parts.join(', ') : 'heuristic mode'}`,
+            'ok'
+          );
+          const modeEl = $('risk-mode');
+          if (modeEl) modeEl.textContent = d.mode ? d.mode.toUpperCase() : 'READY';
+        }
+      })
+      .catch(() => {
+        if (!isRunning) {
+          setStatus('Backend offline — cd backend && bash start.sh', 'warn');
+          const modeEl = $('risk-mode');
+          if (modeEl) modeEl.textContent = 'OFFLINE';
+        }
+      });
   }
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -762,35 +815,22 @@
     injectStyles();
     injectLiveRiskMeter();
 
-    // Wire buttons (after DOM injection)
     setTimeout(() => {
-      const startBtn = $('btn-start-analysis');
-      if (startBtn) {
-        startBtn.addEventListener('click', () => {
+      // Wire all start/stop buttons
+      const startBtns = document.querySelectorAll('.btn-live-analysis, .btn-risk-start, [id="btn-start-analysis"]');
+      startBtns.forEach(btn => {
+        btn.addEventListener('click', () => {
           if (isRunning) stopAnalysis();
           else           startAnalysis();
         });
-      }
+      });
 
-      const pdfBtn = $('btn-download-pdf');
-      if (pdfBtn) pdfBtn.addEventListener('click', requestPDF);
+      const pdfBtns = document.querySelectorAll('.btn-risk-pdf, [id="btn-download-pdf"]');
+      pdfBtns.forEach(btn => btn.addEventListener('click', requestPDF));
 
-      // Health probe
-      fetch('http://localhost:8000/health', { signal: AbortSignal.timeout(2500) })
-        .then(r => r.json())
-        .then(d => {
-          const parts = [];
-          if (d.models)  parts.push('RawNet2+AASIST');
-          if (d.whisper) parts.push('Whisper');
-          if (d.groq)    parts.push('Groq LLM');
-          setStatus(
-            `Backend ready ✓ — ${parts.length ? parts.join(', ') : 'heuristic mode'}`,
-            'ok'
-          );
-          const modeEl = $('risk-mode');
-          if (modeEl) modeEl.textContent = d.mode ? d.mode.toUpperCase() : 'READY';
-        })
-        .catch(() => setStatus('Backend offline — cd backend && bash start.sh', 'warn'));
+      // Initial check & continuous poll every 3.5s
+      pollHealth();
+      setInterval(pollHealth, 3500);
     }, 100);
   }
 

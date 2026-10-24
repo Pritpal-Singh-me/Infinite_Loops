@@ -143,12 +143,16 @@ class FullRawNet2(nn.Module):
 
 def _download_if_missing(file_path: Path, url: str, name: str):
     if not file_path.exists():
+        tmp_path = file_path.with_suffix(".tmp")
         try:
             import urllib.request
             log.info(f"Downloading {name} weights from HuggingFace...")
-            urllib.request.urlretrieve(url, str(file_path))
+            urllib.request.urlretrieve(url, str(tmp_path))
+            tmp_path.rename(file_path)
             log.info(f"{name} download complete ✓")
         except Exception as e:
+            if tmp_path.exists():
+                tmp_path.unlink()
             log.warning(f"Could not auto-download {name}: {e}")
 
 _RAWNET2_URL = "https://huggingface.co/caa-speech-detection-asvspoof2019/rawnet2/resolve/main/best.pt"
@@ -177,6 +181,10 @@ def _init_models():
             log.info("RawNet2 pretrained weights loaded ✓ (ASVspoof 2019)")
         except Exception as e:
             log.warning(f"RawNet2 weight load failed: {e}")
+            try:
+                rn_weights.unlink()
+            except Exception:
+                pass
     else:
         log.warning(f"RawNet2 weight file not found at {rn_weights}")
 
